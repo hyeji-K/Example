@@ -9,7 +9,11 @@ dependencies = [
   "uvicorn",
   "sqlalchemy",
   "pydantic",
+  "pydantic-settings",
   "alembic",
+  "httpx",
+  "openai",
+  "pyyaml",
 ]
 
 [tool.black]

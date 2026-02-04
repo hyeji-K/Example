@@ -1,0 +1,21 @@
+version: 1
+formatters:
+  default:
+    format: "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: default
+    level: DEBUG
+loggers:
+  app.services.tmdb:
+    handlers: [console]
+    level: DEBUG
+    propagate: False
+  app.services.dday:
+    handlers: [console]
+    level: DEBUG
+    propagate: False
+root:
+  level: INFO
+  handlers: [console]

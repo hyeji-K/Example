@@ -25,6 +25,9 @@ yarn-error.log*
 temp/
 coverage-final.json
 
+# Local databases
+*.db
+
 # OS files
 Thumbs.db
 
