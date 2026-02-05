@@ -46,6 +46,12 @@ class DDayResponse(BaseModel):
     genre: list[str] | None = None
 
 
+class LongestDDayResponse(BaseModel):
+    movie_title: str
+    release_date: date
+    dday: str
+
+
 @app.post("/dday", response_model=DDayResponse)
 def upsert_dday(
     payload: DDayRequest,
@@ -97,6 +103,25 @@ def upsert_dday(
 def list_shared_ddays(session: Session = Depends(get_session)) -> list[DDayResponse]:
     records = repo.list_all(session)
     return [_project_to_response(record) for record in records]
+
+
+@app.get("/dday/longest", response_model=LongestDDayResponse | None)
+def get_longest_dday(session: Session = Depends(get_session)) -> LongestDDayResponse | None:
+    records = repo.list_all(session)
+    today = date.today()
+    candidates: list[tuple[Project, int]] = []
+    for project in records:
+        delta = (project.release_date - today).days
+        if delta >= 0:
+            candidates.append((project, delta))
+    if not candidates:
+        return None
+    project, _ = max(candidates, key=lambda item: item[1])
+    return LongestDDayResponse(
+        movie_title=project.movie_title,
+        release_date=project.release_date,
+        dday=_compute_dday(project.release_date),
+    )
 
 
 def _project_to_response(project: Project, *, message: str | None = None) -> DDayResponse:
