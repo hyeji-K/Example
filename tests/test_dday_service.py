@@ -61,6 +61,26 @@ def mock_orchestrate(monkeypatch, sample_movie):
 
 
 @pytest.fixture
+def mock_chat_events(monkeypatch, sample_movie):
+    async def _fake(_: str):
+        yield {"type": "analysis", "message": "요청을 분석 중입니다."}
+        yield {
+            "type": "movie",
+            "movie": sample_movie,
+            "message": f"{sample_movie.title} 정보를 찾았어요.",
+        }
+        final = f"{sample_movie.title}은 {sample_movie.release_date.isoformat()} 개봉 예정"
+        yield {"type": "token", "message": final}
+        yield {"type": "final", "message": final}
+
+    monkeypatch.setattr(
+        "app.services.chat_orchestrator.run_chat_orchestrator_events",
+        _fake,
+    )
+    return _fake
+
+
+@pytest.fixture
 def client():
     return TestClient(app)
 
@@ -84,6 +104,16 @@ def test_dday_endpoint_returns_existing_record(client, mock_orchestrate):
     assert "이미 등록된" in second.json()["message"]
 
 
+def test_dday_endpoint_handles_duplicate_external_id(client, mock_orchestrate):
+    first = client.post("/dday", json={"query": "첫번째 요청"})
+    assert first.status_code == 200
+    second = client.post("/dday", json={"query": "다른 이름"})
+    assert second.status_code == 200
+    body = second.json()
+    assert body["name"] == "첫번째 요청"
+    assert "이미 등록된" in body["message"]
+
+
 def test_dday_endpoint_handles_tmdb_errors(client, monkeypatch):
     def _raise_not_found(_: str):
         raise TMDbNotFound("no movie")
@@ -105,6 +135,33 @@ def test_dday_endpoint_handles_tmdb_errors(client, monkeypatch):
     monkeypatch.setattr("app.main.orchestrate_movie_lookup", _raise_generic)
     resp = client.post("/dday", json={"query": "오류"})
     assert resp.status_code == 502
+
+
+def test_chat_stream_returns_dday(client, mock_chat_events):
+    with client.stream("POST", "/chat/stream", json={"query": "프로젝트 헤일메리"}) as resp:
+        assert resp.status_code == 200
+        body = resp.read().decode()
+        assert "event: dday" in body
+        assert "프로젝트 헤일메리" in body
+
+
+def test_chat_stream_handles_small_talk(client, monkeypatch):
+    async def _respond(_: str):
+        yield {"type": "analysis", "message": "요청을 분석 중입니다."}
+        yield {"type": "token", "message": "일반 대화를 이어가요."}
+        yield {"type": "final", "message": "일반 대화를 이어가요."}
+
+    monkeypatch.setattr(
+        "app.services.chat_orchestrator.run_chat_orchestrator_events",
+        _respond,
+    )
+
+    with client.stream("POST", "/chat/stream", json={"query": "안녕"}) as resp:
+        assert resp.status_code == 200
+        body = resp.read().decode()
+        assert "event: token" in body
+        assert "event: assistant_message" in body
+        assert "일반 대화" in body
 
 
 def test_orchestrate_movie_lookup_without_openai(monkeypatch, sample_movie):
