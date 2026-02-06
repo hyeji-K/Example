@@ -63,6 +63,12 @@ SQLAlchemy model definitions live in `app/models.py` with metadata for migration
         - `ProjectRepository.create(...)` to persist (포스터 URL, 감독/출연/장르 메타 포함).
         - Return success response with rich metadata.
 
+## `/chat/stream` SSE & LangChain 흐름
+- 프론트가 채팅을 제출하면 SSE 요청 1회로 끝까지 처리한다. FastAPI는 먼저 `event: start`를 흘려보낸 뒤, 로컬 DB에 동일 이름이 있으면 즉시 `event: dday` + 캐시된 정보를 응답하고, 최종 문장 하나를 그대로 `token`/`assistant_message`로 송신한다.
+- 신규 요청이면 `run_chat_orchestrator_events()`가 LangChain `astream_events`를 사용해 한 번의 스트림에서 모든 단계를 생성한다. 서버는 이를 그대로 매핑해 다음 이벤트 순서를 보장한다: `analysis` → `tool_started` → (`tool_result` + DB upsert + `dday`) → 연속적인 `token` → 마지막 `assistant_message`. 별도의 두 번째 LLM 호출이나 인위적 지연은 없다.
+- OpenAI 키가 없을 땐 TMDb 직접 조회로 대체하며, 그래도 동일하게 `tool_started`/`movie`/`token`/`final` 이벤트를 만들어 프론트의 단계 표시 로직이 깨지지 않도록 한다.
+- 프론트는 사용자 입력 ID별로 stage 그룹을 저장해 각 사용자 버블 아래에 "요청 분석 중 → TMDB 조회 중 → 정보를 찾았어요"를 순차적으로 렌더링하고, `token` 이벤트를 받아 마지막 어시스턴트 버블을 실시간으로 갱신한다.
+
 3. **Response Payloads**
 ```json
 // success
