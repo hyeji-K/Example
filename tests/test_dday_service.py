@@ -33,6 +33,24 @@ def sample_movie():
         source="tmdb",
         external_id="123",
         is_re_release=False,
+        content_type="movie",
+    )
+
+
+@pytest.fixture
+def sample_tv():
+    return MovieData(
+        title="파운데이션 시즌3",
+        release_date=dt.date(2026, 7, 1),
+        overview="테스트",
+        distributor="Apple TV+",
+        director=None,
+        cast=["배우 C", "배우 D"],
+        genre=["SF"],
+        source="tmdb_tv",
+        external_id="tv-999",
+        is_re_release=False,
+        content_type="tv",
     )
 
 
@@ -198,6 +216,35 @@ def test_orchestrate_movie_lookup_with_langchain_tool(monkeypatch, sample_movie)
         movie = dday_service.orchestrate_movie_lookup("프로젝트 헤일메리")
         assert movie.title == sample_movie.title
         search_mock.assert_called_once()
+
+
+def test_orchestrate_movie_lookup_with_tv_tool(monkeypatch, sample_tv):
+    class FakeMessage:
+        def __init__(self, tool_calls):
+            self.tool_calls = tool_calls
+
+    class FakeLLM:
+        def bind_tools(self, tools):
+            self.tools = tools
+            return self
+
+        def invoke(self, messages):
+            return FakeMessage(
+                [
+                    SimpleNamespace(
+                        name="tv_search",
+                        args={"title": "파운데이션", "first_air_date_year": 2026},
+                    )
+                ]
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    monkeypatch.setattr(dday_service, "ChatOpenAI", lambda *_, **__: FakeLLM())
+    with mock.patch("app.services.tmdb.TMDbClient.search_tv", return_value=sample_tv) as tv_mock:
+        result = dday_service.orchestrate_movie_lookup("파운데이션 시즌3")
+        assert result.title == sample_tv.title
+        assert result.content_type == "tv"
+        tv_mock.assert_called_once()
 
 
 def test_orchestrate_movie_lookup_langchain_without_tool(monkeypatch, sample_movie):
