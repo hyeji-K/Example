@@ -175,19 +175,44 @@ class TMDbClient:
         if not results:
             raise TMDbNotFound(f"TMDb TV search returned no results for '{title}'")
 
-        candidate = self._select_candidate(results, date_field="first_air_date")
-        details = self._request(
-            "GET",
-            f"/tv/{candidate['id']}",
-            params={
-                "language": language or self.default_language,
-                "append_to_response": "credits",
-            },
-        )
+        # Fetch details for top 5 candidates to find any with an upcoming episode.
+        candidate = None
+        details = None
+        today = date.today()
+        
+        for item in results[:5]:
+            item_details = self._request(
+                "GET",
+                f"/tv/{item['id']}",
+                params={
+                    "language": language or self.default_language,
+                    "append_to_response": "credits",
+                },
+            )
+            next_episode = item_details.get("next_episode_to_air")
+            if next_episode and next_episode.get("air_date"):
+                parsed = self._parse_date(next_episode.get("air_date"))
+                if parsed and parsed >= today:
+                    candidate = item
+                    details = item_details
+                    break
+
+        if not candidate:
+            raise TMDbNoUpcomingRelease("No upcoming episodes available for this TV series")
+
         logger.debug("TMDb TV details payload: %s", details)
-        release = self._parse_date(details.get("first_air_date"))
+        
+        # Next episode to air
+        next_episode = details.get("next_episode_to_air")
+        if next_episode and next_episode.get("air_date"):
+            release_raw = next_episode.get("air_date")
+        else:
+            release_raw = details.get("first_air_date") # fallback to satisfy typing, but we know it's future
+
+        release = self._parse_date(release_raw)
         if not release:
             release = date.today()
+            
         return MovieData(
             title=details.get("name") or title,
             release_date=release,

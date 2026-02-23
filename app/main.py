@@ -11,11 +11,13 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+import dataclasses
 
 from app.core.langchain_config import configure_langchain_env
 from app.db import Project, ProjectRepository, get_session, init_models
 from app.services.chat_orchestrator import run_chat_orchestrator_events
 from app.services.dday import build_project_params, orchestrate_movie_lookup
+from app.services.models import MovieData
 from app.services.tmdb import TMDbNoUpcomingRelease, TMDbNotFound, TMDbError
 
 @asynccontextmanager
@@ -60,6 +62,22 @@ class ChatRequest(BaseModel):
     query: str = Field(..., description="일반 대화/툴 요청 문장")
 
 
+class MovieConfirmRequest(BaseModel):
+    query_name: str
+    title: str
+    release_date: date
+    overview: str | None = None
+    distributor: str | None = None
+    director: str | None = None
+    cast: list[str] | None = None
+    genre: list[str] | None = None
+    poster_url: str | None = None
+    source: str | None = None
+    external_id: str | None = None
+    is_re_release: bool = False
+    content_type: str = "movie"
+
+
 def _sse_event(event: str, payload: dict | None = None) -> str:
     data = json.dumps(payload or {}, ensure_ascii=False)
     return f"event: {event}\ndata: {data}\n\n"
@@ -96,7 +114,7 @@ def upsert_dday(
     except TMDbNoUpcomingRelease as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="예정된 개봉일이 없어 D-Day를 만들 수 없어요.",
+            detail="예정된 개봉/방영일이 없어 D-Day를 만들 수 없어요.",
         ) from exc
     except TMDbError as exc:
         raise HTTPException(
@@ -122,6 +140,43 @@ def upsert_dday(
         message="새로운 D-Day를 기록했습니다.",
     )
 
+
+@app.post("/dday/confirm", response_model=DDayResponse)
+def confirm_dday(
+    payload: MovieConfirmRequest,
+    session: Session = Depends(get_session),
+) -> DDayResponse:
+    """Confirm and save a movie D-Day after user approves the preview."""
+    movie = MovieData(
+        title=payload.title,
+        release_date=payload.release_date,
+        overview=payload.overview,
+        distributor=payload.distributor,
+        director=payload.director,
+        cast=payload.cast,
+        genre=payload.genre,
+        poster_url=payload.poster_url,
+        source=payload.source,
+        external_id=payload.external_id,
+        is_re_release=payload.is_re_release,
+        content_type=payload.content_type,
+    )
+    
+    existing = repo.get_by_source_and_external_id(
+        session, source=movie.source, external_id=movie.external_id
+    )
+    if existing:
+        return _project_to_response(
+            existing,
+            message="이미 등록된 개봉일입니다. 모두 함께 기다리고 있어요.",
+        )
+        
+    params = build_project_params(project_name=payload.query_name, movie=movie)
+    record = repo.create(session, **params)
+    return _project_to_response(
+        record,
+        message="새로운 D-Day를 기록했습니다.",
+    )
 
 @app.get("/dday", response_model=list[DDayResponse])
 def list_shared_ddays(session: Session = Depends(get_session)) -> list[DDayResponse]:
@@ -167,7 +222,7 @@ async def stream_chat(
             if existing:
                 response = _project_to_response(
                     existing,
-                    message="이미 등록된 개봉일입니다. 모두 함께 기다리고 있어요.",
+                    message="이미 등록된 디데이입니다. 관련 새로운 소식은 연동 준비 중입니다.",
                 )
                 yield _sse_event("dday", response.model_dump(mode="json"))
                 final_message = _format_dday_sentence(
@@ -210,16 +265,17 @@ async def stream_chat(
                         if existing_by_source:
                             response = _project_to_response(
                                 existing_by_source,
-                                message="이미 등록된 개봉일입니다. 모두 함께 기다리고 있어요.",
+                                message="이미 등록된 디데이입니다. 관련 새로운 소식은 연동 준비 중입니다.",
                             )
+                            yield _sse_event("dday", response.model_dump(mode="json"))
                         else:
-                            params = build_project_params(project_name=normalized, movie=movie)
-                            record = repo.create(session, **params)
-                            response = _project_to_response(
-                                record,
-                                message="새로운 D-Day를 기록했습니다.",
-                            )
-                        yield _sse_event("dday", response.model_dump(mode="json"))
+                            movie_dict = dataclasses.asdict(movie)
+                            movie_dict["release_date"] = movie.release_date.isoformat()
+                            confirm_payload = {
+                                "query_name": normalized,
+                                **movie_dict
+                            }
+                            yield _sse_event("confirmation_required", confirm_payload)
                     elif etype == "token":
                         message = event.get("message")
                         if message:
@@ -241,7 +297,7 @@ async def stream_chat(
         except TMDbNoUpcomingRelease:
             yield _sse_event(
                 "assistant_message",
-                {"message": "예정된 개봉일이 없어 D-Day를 만들 수 없어요."},
+                {"message": "예정된 개봉/방영일이 없어 D-Day를 만들 수 없어요."},
             )
         except TMDbError:
             yield _sse_event(

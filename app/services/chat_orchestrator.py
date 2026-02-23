@@ -171,4 +171,6 @@ def _extract_text(message: Any) -> str:
 
 def _format_movie_sentence(movie: MovieData) -> str:
     dday_label = calculate_dday_label(movie.release_date)
-    return f"{movie.title}은 {movie.release_date.isoformat()} 개봉 예정이라 {dday_label}입니다."
+    is_tv = movie.content_type == "tv" or movie.source == "tmdb_tv"
+    term = "방영" if is_tv else "개봉"
+    return f"'{movie.title}'은(는) {movie.release_date.isoformat()} {term} 예정이라 {dday_label}입니다."
