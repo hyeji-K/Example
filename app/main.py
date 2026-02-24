@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from typing import Mapping, Any
 
 from contextlib import asynccontextmanager
 
@@ -14,9 +15,11 @@ from sqlalchemy.orm import Session
 import dataclasses
 
 from app.core.langchain_config import configure_langchain_env
-from app.db import Project, ProjectRepository, get_session, init_models
+from app.core.auth import get_current_user
+from app.db import DDayRepository, get_session, init_models
+from app.models import Movie, UserDDay
 from app.services.chat_orchestrator import run_chat_orchestrator_events
-from app.services.dday import build_project_params, orchestrate_movie_lookup
+from app.services.dday import orchestrate_movie_lookup
 from app.services.models import MovieData
 from app.services.tmdb import TMDbNoUpcomingRelease, TMDbNotFound, TMDbError
 
@@ -30,7 +33,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="D-Day Service", lifespan=lifespan)
-repo = ProjectRepository()
+repo = DDayRepository()
 
 
 class DDayRequest(BaseModel):
@@ -42,7 +45,7 @@ class DDayResponse(BaseModel):
     movie_title: str
     release_date: date
     dday: str
-    shared: bool = True
+    waiting_count: int = 1
     message: str | None = None
     poster_url: str | None = None
     distributor: str | None = None
@@ -87,9 +90,10 @@ def _sse_event(event: str, payload: dict | None = None) -> str:
 def upsert_dday(
     payload: DDayRequest,
     session: Session = Depends(get_session),
+    user: Mapping[str, Any] = Depends(get_current_user),
 ) -> DDayResponse:
     """Fetch an existing shared D-Day or create a new one via the LLM flow."""
-
+    user_id = user["sub"]
     normalized_name = payload.query.strip()
     if not normalized_name:
         raise HTTPException(
@@ -97,15 +101,8 @@ def upsert_dday(
             detail="query must not be empty",
         )
 
-    existing = repo.get_by_name(session, normalized_name)
-    if existing:
-        return _project_to_response(
-            existing,
-            message="이미 등록된 개봉일입니다. 모두 함께 기다리고 있어요.",
-        )
-
     try:
-        movie = orchestrate_movie_lookup(payload.query)
+        movie_data = orchestrate_movie_lookup(payload.query)
     except TMDbNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -122,22 +119,44 @@ def upsert_dday(
             detail="영화 정보를 불러오는 중 문제가 발생했습니다.",
         ) from exc
 
-    existing_by_source = repo.get_by_source_and_external_id(
+    existing_movie = repo.get_movie_by_source_and_id(
         session,
-        source=movie.source,
-        external_id=movie.external_id,
+        source=movie_data.source,
+        external_id=movie_data.external_id,
     )
-    if existing_by_source:
-        return _project_to_response(
-            existing_by_source,
-            message="이미 등록된 개봉일입니다. 모두 함께 기다리고 있어요.",
+    
+    if existing_movie:
+        existing_dday = repo.get_user_dday(session, user_id, existing_movie.id)
+        if existing_dday:
+            return _dday_to_response(
+                session, existing_movie, existing_dday, 
+                message="이미 서로 기다리고 있는 작품입니다!"
+            )
+    else:
+        existing_movie = repo.create_movie(
+            session,
+            title=movie_data.title,
+            distributor=movie_data.distributor,
+            release_date=movie_data.release_date,
+            director=movie_data.director,
+            cast=movie_data.cast_as_string(),
+            genre=movie_data.genre_as_string(),
+            poster_url=movie_data.poster_url,
+            source=movie_data.source,
+            external_id=movie_data.external_id,
+            is_re_release=movie_data.is_re_release,
+            content_type=movie_data.content_type,
         )
 
-    params = build_project_params(project_name=normalized_name, movie=movie)
-    record = repo.create(session, **params)
-    return _project_to_response(
-        record,
-        message="새로운 D-Day를 기록했습니다.",
+    user_dday = repo.create_user_dday(
+        session,
+        user_id=user_id,
+        movie_id=existing_movie.id,
+        query_name=normalized_name,
+        dday_label=_compute_dday(existing_movie.release_date),
+    )
+    return _dday_to_response(
+        session, existing_movie, user_dday, message="새로운 D-Day를 기록했습니다."
     )
 
 
@@ -145,61 +164,80 @@ def upsert_dday(
 def confirm_dday(
     payload: MovieConfirmRequest,
     session: Session = Depends(get_session),
+    user: Mapping[str, Any] = Depends(get_current_user),
 ) -> DDayResponse:
     """Confirm and save a movie D-Day after user approves the preview."""
-    movie = MovieData(
-        title=payload.title,
-        release_date=payload.release_date,
-        overview=payload.overview,
-        distributor=payload.distributor,
-        director=payload.director,
-        cast=payload.cast,
-        genre=payload.genre,
-        poster_url=payload.poster_url,
-        source=payload.source,
-        external_id=payload.external_id,
-        is_re_release=payload.is_re_release,
-        content_type=payload.content_type,
-    )
+    user_id = user["sub"]
     
-    existing = repo.get_by_source_and_external_id(
-        session, source=movie.source, external_id=movie.external_id
+    existing_movie = repo.get_movie_by_source_and_id(
+        session, source=payload.source, external_id=payload.external_id
     )
-    if existing:
-        return _project_to_response(
-            existing,
+    if not existing_movie:
+        existing_movie = repo.create_movie(
+            session,
+            title=payload.title,
+            distributor=payload.distributor,
+            release_date=payload.release_date,
+            director=payload.director,
+            cast=",".join(payload.cast) if payload.cast else None,
+            genre=",".join(payload.genre) if payload.genre else None,
+            poster_url=payload.poster_url,
+            source=payload.source,
+            external_id=payload.external_id,
+            is_re_release=payload.is_re_release,
+            content_type=payload.content_type,
+        )
+        
+    existing_dday = repo.get_user_dday(session, user_id, existing_movie.id)
+    if existing_dday:
+        return _dday_to_response(
+            session, existing_movie, existing_dday,
             message="이미 등록된 개봉일입니다. 모두 함께 기다리고 있어요.",
         )
         
-    params = build_project_params(project_name=payload.query_name, movie=movie)
-    record = repo.create(session, **params)
-    return _project_to_response(
-        record,
+    user_dday = repo.create_user_dday(
+        session,
+        user_id=user_id,
+        movie_id=existing_movie.id,
+        query_name=payload.query_name,
+        dday_label=_compute_dday(existing_movie.release_date),
+    )
+    return _dday_to_response(
+        session, existing_movie, user_dday,
         message="새로운 D-Day를 기록했습니다.",
     )
 
 @app.get("/dday", response_model=list[DDayResponse])
-def list_shared_ddays(session: Session = Depends(get_session)) -> list[DDayResponse]:
-    records = repo.list_all(session)
-    return [_project_to_response(record) for record in records]
+def list_user_ddays(
+    session: Session = Depends(get_session),
+    user: Mapping[str, Any] = Depends(get_current_user),
+) -> list[DDayResponse]:
+    """List D-Days for the currently authenticated user."""
+    user_id = user["sub"]
+    records = repo.list_user_ddays(session, user_id)
+    return [_dday_to_response(session, movie, dday) for dday, movie in records]
 
 
 @app.get("/dday/longest", response_model=LongestDDayResponse | None)
-def get_longest_dday(session: Session = Depends(get_session)) -> LongestDDayResponse | None:
-    records = repo.list_all(session)
+def get_longest_dday(
+    session: Session = Depends(get_session),
+    user: Mapping[str, Any] = Depends(get_current_user),
+) -> LongestDDayResponse | None:
+    user_id = user["sub"]
+    records = repo.list_user_ddays(session, user_id)
     today = date.today()
-    candidates: list[tuple[Project, int]] = []
-    for project in records:
-        delta = (project.release_date - today).days
+    candidates: list[tuple[UserDDay, Movie, int]] = []
+    for dday, movie in records:
+        delta = (movie.release_date - today).days
         if delta >= 0:
-            candidates.append((project, delta))
+            candidates.append((dday, movie, delta))
     if not candidates:
         return None
-    project, _ = max(candidates, key=lambda item: item[1])
+    _, movie, _ = max(candidates, key=lambda item: item[2])
     return LongestDDayResponse(
-        movie_title=project.movie_title,
-        release_date=project.release_date,
-        dday=_compute_dday(project.release_date),
+        movie_title=movie.title,
+        release_date=movie.release_date,
+        dday=_compute_dday(movie.release_date),
     )
 
 
@@ -207,7 +245,9 @@ def get_longest_dday(session: Session = Depends(get_session)) -> LongestDDayResp
 async def stream_chat(
     payload: ChatRequest,
     session: Session = Depends(get_session),
+    user: Mapping[str, Any] = Depends(get_current_user),
 ) -> StreamingResponse:
+    user_id = user["sub"]
     normalized = payload.query.strip()
     if not normalized:
         raise HTTPException(
@@ -218,77 +258,76 @@ async def stream_chat(
     async def event_stream():
         yield _sse_event("start", {"message": "대화를 시작합니다."})
         try:
-            existing = repo.get_by_name(session, normalized)
-            if existing:
-                response = _project_to_response(
-                    existing,
-                    message="이미 등록된 디데이입니다. 관련 새로운 소식은 연동 준비 중입니다.",
-                )
-                yield _sse_event("dday", response.model_dump(mode="json"))
-                final_message = _format_dday_sentence(
-                    response.movie_title,
-                    response.release_date,
-                    response.dday,
-                )
-                yield _sse_event("token", {"message": final_message})
-                yield _sse_event(
-                    "assistant_message",
-                    {"message": final_message},
-                )
-            else:
-                handled_final = False
-                async for event in run_chat_orchestrator_events(payload.query):
-                    etype = event.get("type")
-                    if etype == "analysis":
-                        yield _sse_event("analysis", {"message": event.get("message", "요청을 분석 중입니다.")})
-                    elif etype == "tool_started":
-                        yield _sse_event(
-                            "tool_started",
-                            {"message": event.get("message", "TMDB에서 개봉 정보를 찾는 중...")},
-                        )
-                    elif etype in {"movie", "tv"}:
-                        movie = event["movie"]
-                        yield _sse_event(
-                            "tool_result",
-                            {
-                                "message": event.get("message", f"{movie.title} 정보를 찾았어요."),
-                                "title": movie.title,
-                                "release_date": movie.release_date.isoformat(),
-                                "content_type": getattr(movie, "content_type", "movie"),
-                            },
-                        )
-                        existing_by_source = repo.get_by_source_and_external_id(
-                            session,
-                            source=movie.source,
-                            external_id=movie.external_id,
-                        )
-                        if existing_by_source:
-                            response = _project_to_response(
-                                existing_by_source,
+            handled_final = False
+            async for event in run_chat_orchestrator_events(payload.query):
+                etype = event.get("type")
+                if etype == "analysis":
+                    yield _sse_event("analysis", {"message": event.get("message", "요청을 분석 중입니다.")})
+                elif etype == "tool_started":
+                    yield _sse_event(
+                        "tool_started",
+                        {"message": event.get("message", "TMDB에서 개봉 정보를 찾는 중...")},
+                    )
+                elif etype in {"movie", "tv"}:
+                    movie = event["movie"]
+                    
+                    # See if this movie already exists globally
+                    existing_movie = repo.get_movie_by_source_and_id(
+                        session,
+                        source=movie.source,
+                        external_id=movie.external_id,
+                    )
+                    
+                    yield _sse_event(
+                        "tool_result",
+                        {
+                            "message": event.get("message", f"{movie.title} 정보를 찾았어요."),
+                            "title": movie.title,
+                            "release_date": movie.release_date.isoformat(),
+                            "content_type": getattr(movie, "content_type", "movie"),
+                        },
+                    )
+                    
+                    has_dday = False
+                    if existing_movie:
+                        existing_dday = repo.get_user_dday(session, user_id, existing_movie.id)
+                        if existing_dday:
+                            response = _dday_to_response(
+                                session, existing_movie, existing_dday,
                                 message="이미 등록된 디데이입니다. 관련 새로운 소식은 연동 준비 중입니다.",
                             )
                             yield _sse_event("dday", response.model_dump(mode="json"))
+                            has_dday = True
+                            
+                    if not has_dday:
+                        movie_dict = dataclasses.asdict(movie)
+                        movie_dict["release_date"] = movie.release_date.isoformat()
+                        confirm_payload = {
+                            "query_name": normalized,
+                            **movie_dict
+                        }
+                        # Retrieve waiting count globally
+                        if existing_movie:
+                            waiting_count = repo.count_waiting_users(session, existing_movie.id)
+                            confirm_payload["waiting_count"] = waiting_count
                         else:
-                            movie_dict = dataclasses.asdict(movie)
-                            movie_dict["release_date"] = movie.release_date.isoformat()
-                            confirm_payload = {
-                                "query_name": normalized,
-                                **movie_dict
-                            }
-                            yield _sse_event("confirmation_required", confirm_payload)
-                    elif etype == "token":
-                        message = event.get("message")
-                        if message:
-                            yield _sse_event("token", {"message": message})
-                    elif etype == "final":
-                        final_message = event.get("message") or "어떤 영화를 기다리고 싶은지 알려주세요."
-                        yield _sse_event("assistant_message", {"message": final_message})
-                        handled_final = True
-                        break
-                if not handled_final:
-                    fallback = "어떤 영화를 기다리고 싶은지 알려주세요."
-                    yield _sse_event("token", {"message": fallback})
-                    yield _sse_event("assistant_message", {"message": fallback})
+                            confirm_payload["waiting_count"] = 0
+                            
+                        yield _sse_event("confirmation_required", confirm_payload)
+                        
+                elif etype == "token":
+                    message = event.get("message")
+                    if message:
+                        yield _sse_event("token", {"message": message})
+                elif etype == "final":
+                    final_message = event.get("message") or "어떤 영화를 기다리고 싶은지 알려주세요."
+                    yield _sse_event("assistant_message", {"message": final_message})
+                    handled_final = True
+                    break
+            if not handled_final:
+                fallback = "어떤 영화를 기다리고 싶은지 알려주세요."
+                yield _sse_event("token", {"message": fallback})
+                yield _sse_event("assistant_message", {"message": fallback})
         except TMDbNotFound:
             yield _sse_event(
                 "assistant_message",
@@ -312,20 +351,23 @@ async def stream_chat(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-def _project_to_response(project: Project, *, message: str | None = None) -> DDayResponse:
+def _dday_to_response(
+    session: Session, movie: Movie, user_dday: UserDDay, *, message: str | None = None
+) -> DDayResponse:
+    waiting_count = repo.count_waiting_users(session, movie.id)
     return DDayResponse(
-        name=project.name,
-        movie_title=project.movie_title,
-        release_date=project.release_date,
-        dday=_compute_dday(project.release_date),
-        shared=True,
+        name=user_dday.query_name,
+        movie_title=movie.title,
+        release_date=movie.release_date,
+        dday=user_dday.dday_label,
+        waiting_count=waiting_count,
         message=message,
-        poster_url=project.poster_url,
-        distributor=project.distributor,
-        director=project.director,
-        cast=_split_list_field(project.cast),
-        genre=_split_list_field(project.genre),
-        content_type=getattr(project, "content_type", "movie"),
+        poster_url=movie.poster_url,
+        distributor=movie.distributor,
+        director=movie.director,
+        cast=_split_list_field(movie.cast),
+        genre=_split_list_field(movie.genre),
+        content_type=getattr(movie, "content_type", "movie"),
     )
 
 

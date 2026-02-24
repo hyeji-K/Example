@@ -18,25 +18,23 @@ class Base(DeclarativeBase):
     pass
 
 
-class Project(Base):
-    """Represents a movie/project entry that everyone can wait for together."""
+class Movie(Base):
+    """Represents a movie/TV series metadata entry cached from TMDb."""
 
-    __tablename__ = "projects"
+    __tablename__ = "movies"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
     )
-    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    movie_title: Mapped[str] = mapped_column(String(255))
+    title: Mapped[str] = mapped_column(String(255))
     distributor: Mapped[str | None] = mapped_column(String(255), nullable=True)
     release_date: Mapped[date] = mapped_column(Date, index=True)
     director: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cast: Mapped[str | None] = mapped_column(Text, nullable=True)
     genre: Mapped[str | None] = mapped_column(String(255), nullable=True)
     poster_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    dday_label: Mapped[str] = mapped_column(String(32))
     source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     external_id: Mapped[str | None] = mapped_column(String(128))
     is_re_release: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -49,8 +47,43 @@ class Project(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("source", "external_id", name="uq_projects_source_external"),
+        UniqueConstraint("source", "external_id", name="uq_movies_source_external"),
     )
 
-    def __repr__(self) -> str:  # pragma: no cover - debugging helper
-        return f"Project(id={self.id}, name={self.name}, release_date={self.release_date})"
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Movie(id={self.id}, title={self.title}, release_date={self.release_date})"
+
+
+from sqlalchemy import ForeignKey
+
+
+class UserDDay(Base):
+    """Maps a user to their personal D-Day tracking of a specific movie.
+    Also tracks the custom name query they used to find it.
+    """
+
+    __tablename__ = "user_ddays"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    movie_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("movies.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    query_name: Mapped[str] = mapped_column(String(255))
+    dday_label: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "movie_id", name="uq_user_movie_dday"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"UserDDay(user_id={self.user_id}, movie_id={self.movie_id})"

@@ -19,8 +19,10 @@ class Settings(BaseSettings):
     langchain_tracing_v2: bool = Field(default=False, alias="LANGCHAIN_TRACING_V2")
     langchain_api_key: str | None = Field(default=None, alias="LANGCHAIN_API_KEY")
     langchain_project: str | None = Field(default=None, alias="LANGCHAIN_PROJECT")
+    database_url: str = Field(default="sqlite:///./dday.db", alias="DATABASE_URL")
+    supabase_jwt_secret: str | None = Field(default=None, alias="SUPABASE_JWT_SECRET")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
 @lru_cache(maxsize=1)

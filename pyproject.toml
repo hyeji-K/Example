@@ -16,6 +16,8 @@ dependencies = [
   "langchain",
   "langchain-openai",
   "pyyaml",
+  "psycopg2-binary",
+  "PyJWT",
 ]
 
 [tool.black]

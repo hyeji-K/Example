@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import date
 from typing import Iterator
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, func
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Base, Project
+from app.core.config import get_settings
+from app.models import Base, Movie, UserDDay
 
 
 def _database_url() -> str:
     """Return the SQLAlchemy URL from env (defaults to local SQLite for dev)."""
-    return os.getenv("DATABASE_URL", "sqlite:///./dday.db")
+    settings = get_settings()
+    # Handle postgresql:// vs postgres:// for SQLAlchemy compatibility
+    url = settings.database_url
+    if url and url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
 
 
 engine = create_engine(_database_url(), future=True)
@@ -39,86 +46,101 @@ def get_session() -> Iterator[Session]:
     finally:
         session.close()
 
+class DDayRepository:
+    """High level data access helpers for personalized D-Day records."""
 
-class ProjectRepository:
-    """High level data access helpers for shared D-Day records."""
-
-    def get_by_name(self, session: Session, name: str) -> Project | None:
-        query = select(Project).where(Project.name == name)
-        return session.execute(query).scalar_one_or_none()
-
-    def get_by_source_and_external_id(
+    def get_movie_by_source_and_id(
         self,
         session: Session,
         *,
         source: str | None,
         external_id: str | None,
-    ) -> Project | None:
+    ) -> Movie | None:
         if not source or not external_id:
             return None
-        query = select(Project).where(
-            Project.source == source,
-            Project.external_id == external_id,
+        query = select(Movie).where(
+            Movie.source == source,
+            Movie.external_id == external_id,
+        )
+        return session.execute(query).scalar_one_or_none()
+        
+    def get_movie_by_title(self, session: Session, title: str) -> Movie | None:
+        query = select(Movie).where(Movie.title == title)
+        return session.execute(query).scalar_one_or_none()
+
+    def get_user_dday(
+        self, session: Session, user_id: str, movie_id: uuid.UUID
+    ) -> UserDDay | None:
+        query = select(UserDDay).where(
+            UserDDay.user_id == user_id,
+            UserDDay.movie_id == movie_id,
         )
         return session.execute(query).scalar_one_or_none()
 
-    def get_by_source_and_external_id(
-        self, session: Session, *, source: str | None, external_id: str | None
-    ) -> Project | None:
-        if not source or not external_id:
-            return None
-        query = select(Project).where(
-            Project.source == source,
-            Project.external_id == external_id,
-        )
-        return session.execute(query).scalar_one_or_none()
-
-    def create(
+    def create_movie(
         self,
         session: Session,
         *,
-        name: str,
-        movie_title: str,
+        title: str,
         distributor: str | None,
         release_date: date,
         director: str | None,
         cast: str | None,
         genre: str | None,
         poster_url: str | None,
-        dday_label: str,
         source: str | None,
         external_id: str | None,
         is_re_release: bool,
         content_type: str,
-    ) -> Project:
-        project = Project(
-            name=name,
-            movie_title=movie_title,
+    ) -> Movie:
+        movie = Movie(
+            title=title,
             distributor=distributor,
             release_date=release_date,
             director=director,
             cast=cast,
             genre=genre,
             poster_url=poster_url,
-            dday_label=dday_label,
             source=source,
             external_id=external_id,
             is_re_release=is_re_release,
             content_type=content_type,
         )
-        session.add(project)
-        session.flush()  # assign IDs before leaving scope
-        session.refresh(project)
-        return project
+        session.add(movie)
+        session.flush()
+        return movie
 
-    def list_upcoming(self, session: Session, today: date) -> list[Project]:
-        query = (
-            select(Project)
-            .where(Project.release_date >= today)
-            .order_by(Project.release_date)
+    def create_user_dday(
+        self,
+        session: Session,
+        *,
+        user_id: str,
+        movie_id: uuid.UUID,
+        query_name: str,
+        dday_label: str,
+    ) -> UserDDay:
+        user_dday = UserDDay(
+            user_id=user_id,
+            movie_id=movie_id,
+            query_name=query_name,
+            dday_label=dday_label,
         )
-        return list(session.execute(query).scalars())
+        session.add(user_dday)
+        session.flush()
+        session.refresh(user_dday)
+        return user_dday
 
-    def list_all(self, session: Session) -> list[Project]:
-        query = select(Project).order_by(Project.release_date)
-        return list(session.execute(query).scalars())
+    def list_user_ddays(self, session: Session, user_id: str) -> list[tuple[UserDDay, Movie]]:
+        """Returns the user's D-Days joined with the Movie metadata."""
+        query = (
+            select(UserDDay, Movie)
+            .join(Movie, UserDDay.movie_id == Movie.id)
+            .where(UserDDay.user_id == user_id)
+            .order_by(Movie.release_date)
+        )
+        return list(session.execute(query).all())
+        
+    def count_waiting_users(self, session: Session, movie_id: uuid.UUID) -> int:
+        """Returns the total number of users waiting for this specific movie."""
+        query = select(func.count(UserDDay.id)).where(UserDDay.movie_id == movie_id)
+        return session.execute(query).scalar_one()
